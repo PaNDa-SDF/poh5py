@@ -1,0 +1,110 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import sys
+import argparse
+import poh5py as p5
+from poh5py import show_license
+
+desc = """
+Update poh5 file format from previous version to the latest one,
+currently version {0}.
+
+You can add hgrid data from legacy grid.rgnXXXXX files.
+""".format(p5.get_lib_version())
+eplg = """
+Copyright(c) 2016 RIST.
+All Rights Reserved.
+
+This software is distributed under the BSD license.
+See the license by --license option.
+"""
+
+def main(argv):
+
+    args = parse_command_line(argv)
+
+    if (args.license):
+        show_license()
+
+    if (args.verbose):
+        print("poh5_files are {0}".format(args.files))
+        print("hgrid_base is {0}".format(args.gbase))
+
+    if (args.files):
+        for fname in args.files:
+            update_file(fname, args.hgrid_base, force=args.force, verbose=args.verbose)
+    else:
+        print('No files specified, do nothing.')
+
+    sys.exit(0)
+
+
+def parse_command_line(argv):
+
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=desc,
+        epilog=eplg)
+
+    ap.add_argument('-V','--verbose', action="store_true",
+                    help='verbose mode')
+    ap.add_argument('-f','--force', action="store_true",
+                    help='force mode')
+    ap.add_argument('-g','--hgrid_base',
+                    help='basename of hgrid data')
+    ap.add_argument('files', metavar='poh5_files', nargs="*",
+                    help='poh5 file to be updated')
+
+    ap.add_argument('--license', action='store_true', default=False,
+                          help='Show license.')
+    args = ap.parse_args()
+
+    if (not args.files and not args.license):
+        ap.print_usage()
+
+
+    return args
+
+
+def update_file(fname, gbase, force=False, verbose=False):
+    with p5.File(fname,new=False) as f:
+        print('Processing {}'.format(fname))
+        file_version=f.attrs['poh5_version']
+        if (verbose):
+            f.show_global_attrs()
+            print("file_version is {}".format(file_version))
+
+        if (file_version >= p5.get_lib_version() and not force):
+            print("This file is of current (or even newer) version, do nothing.")
+        else:
+            if (f.attrs['is_complete']):
+                print("This file is complete file.")
+                npe = 0
+                mpe = 0
+            else:
+                npe = get_num_pe(f.attrs['rlevel'],f.attrs['num_of_rgn'])
+                mpe = get_my_pe(f.attrs['rgnid'][0],f.attrs['num_of_rgn'])
+            if (verbose):
+                print("npe is {0}, mpe is {1}".format(npe,mpe))
+            f.attrs["num_of_pe"]=npe
+            f.attrs["my_pe"]=mpe
+            if (gbase):
+                if (verbose):
+                    print('hgrid is read from "{}"'.format(gbase))
+                f.create_hgrid()
+                f.set_hgrid_from_file(gbase)
+
+
+def get_num_pe(rl,nrgn):
+    tot_rgn = 10*4**rl
+    return tot_rgn//nrgn
+
+
+def get_my_pe(rgn1,nrgn):
+    my_pe = rgn1//nrgn
+    return my_pe
+
+
+if (__name__ == "__main__"):
+    main(sys.argv)
+

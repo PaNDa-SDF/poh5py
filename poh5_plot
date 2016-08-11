@@ -1,0 +1,602 @@
+#!/usr/bin/env python
+from __future__ import print_function, division
+import os
+import sys
+import argparse
+
+import yaml
+import h5py
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.dates import num2date
+from mpl_toolkits.basemap \
+    import Basemap, addcyclic, supported_projections, projection_params
+### See https://github.com/matplotlib/natgrid for the license of
+### NCAR natgrid and its python interface.
+use_natgrid = False
+if (use_natgrid):
+    import matplotlib.mlab as mlab
+else:
+    import scipy.interpolate as intp
+try:
+    use_easygui = True
+    import easygui as eg
+except ImportError:
+    use_easygui = False
+# easygui ver.0.96 doesn't support fileopenbox with `multiple`.
+if (eg.egversion.startswith("0.96")):
+    use_easygui = False
+
+from poh5py import cart2sphe, show_license
+
+desc = """\
+Quick plot for poh5 datafile[s].
+
+You can plot one horizontal slice of one variable at one timestep.
+Scatter/contour/filled plot available for ICO or regridded latlon
+data.
+"""
+
+eplg = """\
+You need `easygui` version __0.97 or later__ for filename/variable
+selecting dialog box.
+
+For latlon regrid, number of grid points is
+- `NP` for longitudinal,
+- half of `NP` for latitudinal,
+so `NP` should be even.
+
+CONFIGURATION:
+Default value of almost all command line arguments above are read from
+configuration file if present. Default file is '{conffile_default}' and
+you can set this by environment variable POH5_PLOT_CONF.
+
+Run with `--save_config=<conffile>` option creates configuration file
+with all values, and you can edit this for your own version. Note that
+if <conffile> is omitted, the same name of reading is used and
+__OVERWRITE__ this.
+
+COLORMAP:
+List of valid colormaps are available at
+<http://matplotlib.org/examples/color/colormaps_reference.html>
+
+MAP PROJECTION:
+List of valid map projection are available by --list_projection option.
+
+CAUTION:
+- At present, contouring (not filling) ICO data NOT working, because of
+some bugs in matplotlib.basemap.
+- Filling with limited domain on some map projection seems NOT work.
+
+Copyright(c) 2016 RIST.
+All Rights Reserved.
+
+This software is distributed under the BSD license.
+See the license by --license option.
+"""
+
+savefig_default = "poh5plot.pdf"
+
+conffile_default = "poh5_plot.conf"
+
+conf_default = {
+    "debug": None,
+    "varname": None,
+    "layer": 0,
+    "step": 0,
+    "missval": -9.99e33,
+    "latlon": False,
+    "npoints": 360,
+    "bgmap": None,
+    "bgscale": 0.2,
+    "mapreso": 'l',
+    "contour": False,
+    "files": None,
+    "filled": False,
+    "ncontour": 10,
+    "vmin": None,
+    "vmax": None,
+    "cmap": "Greys",
+    "extend": False,
+    "marker": 'h',
+    "markersize": 20,
+    "proj": 'robin',
+    "domain": [None, None, None, None],
+    "lon0": 0.,
+    "lat0": 0.,
+    "blat": 0.,
+    "figsize": [11, 8.5],
+    "title": None,
+    "savefig": None
+    }
+
+
+def main(argv):
+
+    conffile = os.environ.get('POH5_PLOT_CONF')
+    if (not conffile):
+        conffile = conffile_default
+
+    conf = read_conf(conffile)
+
+    args = parse_command_line(argv, conf, conffile)
+
+    if (args.license):
+        show_license()
+
+    if (args.list_projection):
+        print('Supported Projections:')
+        print(supported_projections)
+        sys.exit(0)
+
+    if (args.save_config):
+        for k in conf.keys():
+            try:
+                conf[k] = vars(args)[k]
+            except KeyError:
+                pass
+        save_conf(conf, args.save_config)
+        sys.exit(0)
+
+    if (args.debug):
+        print('configuration:')
+        for v in vars(args):
+            print('{0:>15}: {1}'.format(v, getattr(args, v)))
+
+    debug = args.debug
+
+    if (not args.files):
+        if (use_easygui):
+            files = eg.fileopenbox(
+                multiple=True,
+                filetypes=["poh5 file", "*.h5"],
+                default="*.h5",
+                title="Select poh5 file:"
+            )
+        else:
+            files = None
+    else:
+        files = sorted(args.files)
+
+    if (not files):
+        print("No files given, exit.")
+        sys.exit(0)
+
+    varname = args.varname
+
+    layer = args.layer
+    step = args.step
+    fmiss = args.missval
+
+    latlon = args.latlon
+    npts = args.npoints
+
+    bgmap = args.bgmap
+    bgscale = args.bgscale
+    mapreso = args.mapreso
+
+    contour = args.contour
+    filled = args.filled
+    ncont = args.ncontour
+    cmapname = args.cmap
+    vmin, vmax = (args.vmin, args.vmax)
+    valextend = 'both' if args.extend else 'neither'
+    marker = args.marker
+    msize = args.markersize
+
+    proj = args.proj
+    lllon, lllat, urlon, urlat = args.domain
+    lon_0, lat_0 = (args.lon0, args.lat0)
+    blat = args.blat
+
+    title = args.title
+    savefig = args.savefig
+    figsize = tuple(args.figsize)
+
+    ################################
+    ###### Retrieving Dataset ######
+    ################################
+
+    # Check first file to read global attributes.
+    # Mixing different data set will be mess.
+    with h5py.File(files[0], new=False) as f:
+        gl = f.attrs['glevel']
+        rl = f.attrs['rlevel']
+        gall1d = 2**(gl-rl)+2
+        totrgn = 4**rl*10
+        varlist = list(f.get('/Var').keys())
+
+        if (varname):
+            if (varname in varlist):
+                pass
+            else:
+                print('Invalid variable:', varname)
+                print('Available variables are:', varlist)
+                sys.exit(1)
+        else:
+            if (use_easygui):
+                varname = eg.choicebox('Select variable', 'Varname', varlist)
+            else:
+                print('Available variable:', varlist)
+                print('No variable specified,  use the first one:', varlist[0])
+                varname = varlist[0]
+
+        if (not varname):
+            print("No Variable given, exit.")
+            sys.exit(0)
+        else:
+            print("Plotting variable: {}".format(varname))
+
+        g = f.get('/Var/'+varname)
+        var_unit = g.attrs['units'].decode('utf-8')
+        var_desc = g.attrs['description'].decode('utf-8')
+        var_note = g.attrs['note'].decode('utf-8')
+        time = f.get('/Var/'+varname+'/time')
+        ### matplotlib.dates.num2date takes __days__, not seconds.
+        ts = num2date(time[step][0]/86400.)
+        te = num2date(time[step][1]/86400.)
+        if (debug):
+            form = '{:>15}: {!s}'
+            print('Variable info:')
+            print(form.format('units', var_unit))
+            print(form.format('description', var_desc))
+            print(form.format('note', var_desc))
+            print(form.format('step', step))
+            print(form.format('time[step]', time[step]))
+
+    # Note that np.nan is treated as a missing value.
+    x = np.empty([totrgn, gall1d-2, gall1d-2])
+    y = np.empty([totrgn, gall1d-2, gall1d-2])
+    z = np.empty([totrgn, gall1d-2, gall1d-2])
+    v = np.empty([totrgn, gall1d-2, gall1d-2])
+
+    # Read in data from each files.
+    for name in files:
+        f = h5py.File(name, new=False)
+        print('Reading "{}"'.format(name))
+        nrgn = f.attrs['num_of_rgn']
+        rgnid = f.attrs['rgnid']
+
+        grd = f.get('/Grd/Hgrid/grd_x')
+        dat = f.get('/Var/'+varname+'/data')
+
+        rgn_str = rgnid[0]
+        rgn_end = rgnid[nrgn-1]+1
+
+        # Note that cutting off halo region.
+        # Todo: How to salvage Polar point ?
+        x[rgn_str:rgn_end, :, :] = grd[0, :, 1:gall1d-1,  1:gall1d-1]
+        y[rgn_str:rgn_end, :, :] = grd[1, :, 1:gall1d-1,  1:gall1d-1]
+        z[rgn_str:rgn_end, :, :] = grd[2, :, 1:gall1d-1,  1:gall1d-1]
+        v[rgn_str:rgn_end, :, :] \
+            = dat[step, :, layer,  1:gall1d-1,  1:gall1d-1]
+
+    (lons, lats) = cart2sphe(x.ravel(), y.ravel(), z.ravel(), deg=True)
+
+    # Todo: Is there a better way to replace fmiss by np.nan ?
+    # vm = ma.masked_values(v, fmiss)
+    # v[vm.mask]=np.nan
+    v[v < fmiss] = np.nan
+
+    if (latlon):
+        print('Grid mode: LatLon')
+        pts = np.column_stack((lons, lats))
+        print('Generating points: {0}x{1}'.format(npts, npts//2))
+
+        delta = 360./npts
+
+        # Todo: Which is the best way to place (gx,gy)?
+        gx = np.linspace(-180+delta/2., 180-delta/2., npts)
+        # gx = np.linspace(-180.,180.,npts+1)
+        # gx = np.linspace(-180-delta/2.,180.+delta/2,npts)
+        gy = np.linspace(-90+delta/2., 90-delta/2., npts//2)
+        # gy = np.linspace(-90., 90.,npts/2+1)
+        # gy = np.linspace(-90.-delta/2, 90.,npts/2)
+
+        if (use_natgrid):
+            # From matplotlib.mlab documentation
+            # (http://matplotlib.org/api/mlab_api.html): If interp is `nn`
+            # (the default), uses natural neighbor interpolation based on
+            # Delaunay triangulation. This option is only available if the
+            # mpl_toolkits.natgrid module is installed. This can be
+            # downloaded from https://github.com/matplotlib/natgrid. The
+            # (xi, yi) grid must be regular and monotonically increasing
+            # in this case.
+            #
+            if (debug):
+                print('Using mlab.griddata with natgrid.')
+            vv = mlab.griddata(lons, lats, v.ravel(), gx, gy, interp='nn')
+        else:
+            # Using scipy.interpolate version of griddata is faster than
+            # mlab version.
+            #
+            if (debug):
+                print('Using scipy.interpolate.griddata.')
+            mgx, mgy = np.meshgrid(gx, gy)
+            vv = intp.griddata(pts, v.ravel(), (mgx, mgy), method='linear')
+
+    else:
+        print('Grid mode: ICO')
+        vv = v.ravel()
+
+    ################################
+    ######      Ploting       ######
+    ################################
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+
+    m = Basemap(projection=proj, resolution=mapreso,
+                lon_0=lon_0, lat_0=lat_0,
+                llcrnrlon=lllon, llcrnrlat=lllat,
+                urcrnrlon=urlon, urcrnrlat=urlat,
+                boundinglat=blat)
+    print("Projection:", proj)
+    if (debug):
+        print("params for {0}: {1}".format(proj, projection_params[proj]))
+        print("domains:", lllon, lllat, urlon, urlat)
+        print("lon0/lat0:", lon_0, lat_0)
+        print("blat:", blat)
+
+    cm = plt.get_cmap(cmapname)
+    print("Colormap:", cm.name)
+
+    if (latlon):
+        vv, gx = addcyclic(vv, gx)
+        mgx, mgy = np.meshgrid(gx, gy)
+        mgx, vv = m.shiftdata(mgx, datain=vv, lon_0=lon_0)
+        mx, my = m(mgx, mgy)
+    else:
+        mx, my = m(lons, lats)
+
+    # There seems to be a bug around automatic levels setting when
+    # vmin/vmax are given, behavior of contour() and contourf() are
+    # different.  So use explicit levels setting if vmin/vmax are
+    # given.
+    autorange = not (vmin or vmax)
+    if (not vmin):
+        vmin = np.nanmin(vv)
+    if (not vmax):
+        vmax = np.nanmax(vv)
+
+    if (debug):
+        print("Plotted values:")
+        form = "{0:>15}: {1}"
+        print(form.format("min,max", [np.nanmin(vv), np.nanmax(vv)]))
+        print(form.format("autorange", autorange))
+        print(form.format("vmin,vmax", [vmin, vmax]))
+        print(form.format("valextend", valextend))
+
+    if (contour or filled):
+        if (autorange):
+            lvls = ncont
+            print('Set number of contours:', lvls)
+        else:
+            lvls = np.linspace(vmin, vmax, ncont+1)
+            print('Set contouring levels:', lvls)
+
+    cblabel = "[{}]".format(var_unit)
+    if (contour):
+        g = m.contour(mx, my, vv, lvls,
+                      vmin=vmin, vmax=vmax, cmap=cm, extend=valextend)
+        cl = plt.clabel(g,
+                        fmt='%.0f', fontsize=8, inline=False)
+        cb = m.colorbar(g,
+                        location='bottom', label=cblabel, extend=valextend)
+    elif (filled):
+        g = m.contourf(mx, my, vv, lvls,
+                       vmin=vmin, vmax=vmax, cmap=cm, extend=valextend,
+                       tri=(not latlon))
+        cb = m.colorbar(g,
+                        location='bottom', label=cblabel, extend=valextend)
+    else:
+        g = m.scatter(mx, my, c=vv, s=msize,
+                      vmin=vmin, vmax=vmax,
+                      marker=marker, cmap=cm, edgecolor='none')
+        cb = m.colorbar(g,
+                        location='bottom', label=cblabel, extend=valextend)
+
+    ### Background map
+    if (bgmap == 'bm'):
+        m.bluemarble(scale=bgscale)
+    elif (bgmap == 'et'):
+        m.etopo(scale=bgscale)
+    elif (bgmap == 'sr'):
+        m.shadedrelief(scale=bgscale)
+    else:
+        m.drawcoastlines(linewidth=0.2)
+        m.drawcountries(linewidth=0.2)
+    m.drawmeridians(np.arange(0, 360, 30))
+    m.drawparallels(np.arange(-90, 90, 30))
+
+    ### text
+    tfmt = '%Y/%m/%d %H:%M:%S'
+    toprighttext = "z={}".format(layer)
+    toprighttext += '\n{}'.format(ts.strftime(tfmt))
+    if (ts != te):
+        toprighttext += '\n{}'.format(te.strftime(tfmt))
+    ax.text(1, 1, toprighttext,
+            horizontalalignment='right',
+            verticalalignment='bottom',
+            transform=ax.transAxes)
+
+    toplefttext = varname
+    if (var_desc):
+        toplefttext += '\n{}'.format(var_desc)
+    ax.text(0, 1, toplefttext,
+            horizontalalignment='left',
+            verticalalignment='bottom',
+            transform=ax.transAxes)
+
+    if (title):
+        ax.set_title(title)
+    else:
+        pass
+
+    if (bool(savefig)):
+        plt.savefig(savefig)
+        print("Plot saved to a file:", savefig)
+    else:
+        plt.show()
+        plt.close()
+
+    sys.exit(0)
+
+
+def read_conf(conffile=None):
+    conf = conf_default
+    try:
+        with open(conffile, "r") as f:
+            print('Reading conffile "{}"'.format(conffile))
+            conf_read = yaml.load(f)
+    except IOError as e:
+        print('Warn: reading conffile failed with:')
+        print(' ', e)
+        print('Uses default configuration.')
+    else:
+        if (conf_read):
+            for k in conf_read.keys():
+                conf[k] = conf_read[k]
+    return conf
+
+
+def save_conf(conf, conffile=None):
+    if (not conffile):
+        conffile = conffile_default
+    try:
+        f = open(conffile, "w+")
+        print('Saving configuration to "{}"'.format(conffile))
+        f.write("""\
+### Configuraition for poh5_plot.py in -*- yaml -*-.
+### This file is created by the program and may be overwritten
+### by --save_config option.
+###
+### This file is in yaml format, do NOT forget a space after colon(:).
+###\n
+""")
+        f.write(yaml.dump(conf, default_flow_style=False))
+        f.close()
+    except IOError:
+        print('Skip saving configuration')
+
+    return None
+
+
+def parse_command_line(argv, conf, conffile):
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=desc,
+        epilog=eplg.format(conffile_default=conffile_default))
+
+    ap.add_argument('-d', '--debug', action='store_true',
+                    help='debug mode')
+
+    ap.add_argument('files', nargs='*', default=conf['files'],
+                    help='poh5 file[s]')
+    ap.add_argument('-v', '--varname', default=conf['varname'],
+                    help='variable name')
+    ap.add_argument('-z', '--layer',  type=int, default=conf['layer'],
+                    help='vertical layer for 3D variable (0 is lowest)')
+    ap.add_argument('-s', '--step', type=int, default=conf['step'],
+                    help='time step to plot(0 is first)')
+    ap.add_argument('--missval', type=float, default=conf['missval'],
+                    help="""
+                    value to be treated as a missing
+                    value (default:%(default)s)""")
+
+    ap.add_argument('-l', '--latlon', action='store_true',
+                    default=conf['latlon'],
+                    help='plot regridded LatLon data')
+    ap.add_argument('--npoints', type=int, default=conf["npoints"],
+                    metavar='NP', help="""
+                    number of longitudinal points in latlon
+                    coord (default:%(default)s)""")
+
+    plottype = ap.add_mutually_exclusive_group()
+    plottype.add_argument('-c', '--contour', action='store_true',
+                          default=conf["contour"],
+                          help='contour plot')
+    plottype.add_argument('-f', '--filled', action='store_true',
+                          default=conf["filled"],
+                          help='contour filled plot')
+    ap.add_argument('--ncontour', dest='ncontour', type=int,
+                    default=conf["ncontour"],
+                    metavar='NC', help="""
+                    number of contour levels (default:%(default)s)""")
+    ap.add_argument('--cmap', default=conf["cmap"],
+                    help='colormap name')
+    ap.add_argument('--vmin', type=float, default=conf["vmin"],
+                    help='minimum value to plot')
+    ap.add_argument('--vmax', type=float, default=conf["vmax"],
+                    help='maximum value to plot')
+    ap.add_argument('--extend', action='store_true', default=conf['extend'],
+                    help='extend value range')
+    ap.add_argument('--marker', default=conf['marker'],
+                    help='marker type for scatter plot')
+    ap.add_argument('--markersize', type=int, default=conf['markersize'],
+                    help='marker size for scatter plot')
+
+    ap.add_argument('--proj', default=conf['proj'],
+                    help='map projection name (default:%(default)s)')
+    ap.add_argument('--list_projection', action='store_true',
+                    help='show available projection of Basemap')
+    ap.add_argument('--domain', type=float, nargs=4, default=conf['domain'],
+                    metavar=('LLLON', 'LLLAT', 'URLON', 'URLAT'),
+                    help="""
+                    lower left/upper right corner lat/lon of a map domain""")
+    ap.add_argument('--lon0', type=float, default=conf['lon0'],
+                    help='lon_0 parameter for Basemap projection')
+    ap.add_argument('--lat0', type=float, default=conf['lat0'],
+                    help='lat_0 parameter for Basemap projection')
+    ap.add_argument('--blat', type=float, default=conf['blat'],
+                    metavar='BoudingLat', help="""
+                    bounding latitude for pole-centered projections
+                    (such as np*,sp*)
+                    """)
+
+    ap.add_argument('--bgmap',
+                    choices=['bm', 'et', 'sr'], default=conf["bgmap"],
+                    help="""
+                    use some image as map background,
+                    choices are:
+                    bg:bluemarble, et:etopo, sr:shadedrelief""")
+    ap.add_argument('--bgscale', type=float, default=conf["bgscale"],
+                    metavar='SCALE', help="""
+                    scale for background map specified by
+                    bgmap (default:%(default)s)""")
+    ap.add_argument('--mapreso', choices=['c', 'l', 'i', 'h', 'f'],
+                    default=conf['mapreso'],
+                    help='coastline resolution')
+
+    ap.add_argument('--title', default=conf['title'],
+                    help='title strings on top')
+    ap.add_argument('--figsize', type=float, nargs=2, default=conf['figsize'],
+                    metavar=('X', 'Y'), help="""
+                    size of window in inch (default:%(default)s)""")
+
+    if (conf['savefig']):
+        savefig_def = conf['savefig']
+        savefig_con = conf['savefig']
+    else:
+        savefig_def = None
+        savefig_con = savefig_default
+    ap.add_argument('--savefig', nargs='?', default=savefig_def, const=savefig_con,
+                    help="""
+                    save figure, no window (default:%(default)s,
+                    const:%(const)s)""")
+
+    ap.add_argument('--save_config', nargs='?', const=conffile,
+                    help="""
+                    save config file. CONFIG FILE WILL BE OVERRIDEN.
+                    (default:%(default)s, const:%(const)s)""")
+
+    ap.add_argument('--license', action='store_true', default=False,
+                    help='Show license.')
+
+    args = ap.parse_args()
+
+    return args
+
+
+if (__name__ == "__main__"):
+    main(sys.argv)

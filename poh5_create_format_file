@@ -1,0 +1,176 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import sys
+from datetime import datetime, timedelta
+import argparse
+import numpy as np
+import poh5py as p5
+from poh5py import cart2sphe, show_license
+from matplotlib.dates import date2num, num2date
+
+desc = """Create example poh5 file."""
+eplg = """
+CAUTION: poh5 files is overwritten if they exist.
+
+Copyright(c) 2016 RIST.
+All Rights Reserved.
+
+This software is distributed under the BSD license.
+See the license by --license option.
+"""
+
+tfmt="%Y/%m/%d %H:%M:%S"
+tstart = "2016/05/21 00:00:00"
+delt = 6
+tunit = "hours"
+
+def parse_command_line(argv):
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=desc, epilog=eplg)
+
+    ap.add_argument('-o','--output_base', default='poh5_example',
+                    help='basename of output poh5 file (default: %(default)s)')
+    ap.add_argument('--hgrid_base',
+                    help='basename of hgrid files to be included')
+
+    ap.add_argument('-g', '--gl', type=int, default=5,
+                    help='glevel (default: %(default)s)')
+    ap.add_argument('-r', '--rl', type=int, default=0,
+                    help='rlevel (default: %(default)s)')
+    ap.add_argument('-n', '--npe', type=int, default=1,
+                    help='num of PEs, 0 means complete file (default: %(default)s)')
+    ap.add_argument('-m', '--mpe', type=int, default=0,
+                    help='my PE, starts from 0 (default: %(default)s)')
+    ap.add_argument('--desc', default=u'Example of poh5 format.',
+                    help='global description')
+    ap.add_argument('--note',
+                    default=u'This file is to show the format of poh5 file.',
+                    help='global note')
+    ap.add_argument('--tunit', default=tunit,
+                    help='unit of times, such as days, hours, etc. (default: %(default)s)')
+    ap.add_argument('--delt', type=int, default=delt,
+                    help='delta T (default: %(default)s)')
+    ap.add_argument('--tstart', default=tstart,
+                    help='initial time (default: %(default)s)')
+
+    ap.add_argument('--license', action='store_true', default=False,
+                          help='Show license.')
+
+    args = ap.parse_args()
+
+    return args
+
+
+def main(argv):
+
+    args = parse_command_line(argv)
+
+    if (args.license):
+        show_license()
+
+    base = args.output_base
+    gl = args.gl
+    rl = args.rl
+    npe = args.npe
+    mpe = args.mpe
+    desc = args.desc
+    note = args.note
+    hgrid_base = args.hgrid_base
+
+    v1_name = 'ta'
+    v1_desc = u'air_temperature'
+    v1_note = u"""Air temperature is the bulk temperature of the air, not the surface (skin) temperature."""
+    v1_units = 'K'
+    v1_lname = 'ZSALL40'
+    v1_nlayer = 40
+    v1_dtype = '>f8'  # default
+
+    v2_name = 'psl'
+    v2_desc = u'air_pressure_at_sea_level'
+    v2_note = u"""sea_level means mean sea level, which is close to the geoid in sea areas. Air pressure at sea level is the quantity often abbreviated as MSLP or PMSL."""
+    v2_units = 'hPa'
+    v2_lname = 'ZSSFC1'
+    v2_nlayer = 1
+    v2_dtype = '>f4'
+
+    if (npe > 0):
+        name = base+'.pe'+str(mpe).zfill(6)+'.h5'
+        print('Creating poh5 file:', name)
+    else:
+        name = base+'.peall.h5'
+
+    with p5.File(name) as f:
+        f.set_global_attrs(gl, rl, npe, mpe, desc, note)
+        f.show_global_attrs()
+
+        f.create_hgrid()
+        f.set_hgrid_from_file(hgrid_base)
+
+        f.create_variable(v1_name, v1_nlayer, v1_lname, units=v1_units, desc=v1_desc, note=v1_note)
+        f.create_variable(v2_name, v2_nlayer, v2_lname, units=v2_units, desc=v2_desc, note=v2_note,
+                          dtype=v2_dtype)
+
+        lall = f.attrs['num_of_rgn']
+        gall1d = f.gall1d
+
+        v1_dshape = (lall, v1_nlayer, gall1d, gall1d)
+        # v1_dshape=(lall,1,gall1d,gall1d)   # use this to cause error
+        v1_data = np.ones(v1_dshape, dtype=v1_dtype)
+
+        v2_dshape = (lall, v2_nlayer, gall1d, gall1d)
+        v2_data = np.ones(v2_dshape, dtype=v2_dtype)
+
+        if (hgrid_base):
+            grd = f.get('/Grd/Hgrid/grd_x')
+            (lon, lat) = cart2sphe(
+                grd[0, :, :, :],
+                grd[1, :, :, :],
+                grd[2, :, :, :],
+                deg=True)
+
+            v1_data[:,0,:,:] = (290. + 10. *np.cos(np.deg2rad(lat))+2.*np.sin(np.deg2rad(lon)* 4.))
+            for k in range(1,v1_data.shape[1]):
+                v1_data[:,k,:,:] = v1_data[:,0,:,:] * (1.-np.float(k)/v1_data.shape[1])
+
+            ### Note: v2 is surface data.
+            v2_data[:,0,:,:] = 1034. + 5. *np.cos(np.deg2rad(lat)*2.)+2.*np.sin(np.deg2rad(lon)*3.)
+
+
+        t = datetime.strptime(tstart, tfmt)
+        # t = datetime.today()
+
+        if (tunit == 'days'):
+            dt = timedelta(days=args.delt)
+        elif (tunit == 'seconds'):
+            dt = timedelta(seconds=args.delt)
+        elif (tunit == 'minutes' ):
+            dt = timedelta(minutes=args.delt)
+        elif (tunit == 'hours' ):
+            dt = timedelta(hours=args.delt)
+        elif (tunit == 'weeks' ):
+            dt = timedelta(weeks=args.delt)
+        else:
+            print('Invalid tunit: {}'.format(tunit))
+            sys.exit(1)
+            
+        ts = int((date2num(t))*86400)
+        t = t+dt
+        te = int((date2num(t))*86400)
+        f.add_variable(v1_name, ts, te, v1_data)
+        f.add_variable(v2_name, ts, te, v2_data)
+
+        for i in range(10):
+            ts = te
+            t = t+dt
+            te = int((date2num(t))*86400)
+
+            v1_data = v1_data+1.
+            v2_data = v2_data+1.
+            if (i % 2 == 1):
+                f.add_variable(v1_name, ts, te, v1_data)
+            f.add_variable(v2_name, ts, te, v2_data)
+
+
+if (__name__ == "__main__"):
+    main(sys.argv)
